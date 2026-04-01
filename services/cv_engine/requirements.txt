@@ -1,0 +1,5 @@
+ultralytics
+opencv-python
+deep-sort-realtime
+kafka-python
+numpy
