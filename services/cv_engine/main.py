@@ -7,5 +7,5 @@ from object_tracker import process_video
 
 
 
-process_video("inputs/150.0-180.0.mp4")
+process_video("inputs/test_low.mp4")
 
