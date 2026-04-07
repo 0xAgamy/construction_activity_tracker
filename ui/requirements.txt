@@ -1,0 +1,11 @@
+gradio
+pandas
+psycopg2-binary
+opencv-python
+numpy
+redis
+ultralytics
+deep-sort-realtime
+kafka-python
+torch
+torchvision

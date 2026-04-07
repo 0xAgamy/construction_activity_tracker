@@ -2,6 +2,7 @@
 import cv2
 import numpy as np
 import os,csv
+import json
 def parse_detections(results)->list:
     """convert yolo results to detections"""
 
@@ -49,8 +50,9 @@ def draw_annotations(frame: np.ndarray, payload: dict) -> None:
 def video_saver(frames:np.ndarray):
     """i Create this function to better output video analysis
     """
-    h, w ,l= frames[0].shape
 
+    h, w ,c= frames[0].shape
+    print(f"video frames shape{ frames[0].shape}")
     forcc=cv2.VideoWriter_fourcc(*'mp4v') 
     out= cv2.VideoWriter("outputs/output.mp4",forcc,30,(w,h))
     for frame in frames:
@@ -59,5 +61,18 @@ def video_saver(frames:np.ndarray):
     out.release()
 
 
+
+def save_results_json(payloads):
+    file_path = "outputs/all_predictions.json"
+    if os.path.exists(file_path):
+        with open(file_path, "r") as f:
+            data = json.load(f)
+    else:
+        data = []
+
+    data.append(payloads)
+
+    with open(file_path, "w") as f:
+        json.dump(data, f, indent=2)
 
 

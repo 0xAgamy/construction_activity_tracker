@@ -23,12 +23,19 @@ from kafka import KafkaProducer
 from kafka.errors import NoBrokersAvailable
 import helpers
 from activity_classifier import ActivityClassifier
+import sys
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
 
 from denseflow import OpticalFlowEngine
-KAFKA_BOOTSTRAP = "localhost:9092"
+from services.kafka_service.kafka_engine import create_kafka_producer
+import redis
+KAFKA_BOOTSTRAP = os.getenv("KAFKA_BOOTSTRAP", "localhost:9092")
 KAFKA_TOPIC     =  "equipment-events"
 SESSION_ID      = str(uuid.uuid4())[:8]
 COLLECT_TRAINING_DATA=True
+REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
+REDIS_PORT = int(os.getenv("REDIS_PORT", 6379))
+REDIS_FRAME_KEY = "latest_frame"
 
 STATE_DEBOUNCE_FRAMES = 10     # Majority-vote window for state smoothing
 
@@ -97,27 +104,6 @@ class UtilizationTracker:
         return rows
 
 
-def create_kafka_producer(retries: int = 10, delay: int = 5) -> KafkaProducer:
-    for attempt in range(retries):
-        try:
-            producer = KafkaProducer(
-                bootstrap_servers=[KAFKA_BOOTSTRAP],
-                value_serializer=lambda v: json.dumps(v).encode("utf-8"),
-                # Reliability settings
-                acks="all",
-                retries=3,
-                linger_ms=10,        # Small batching window
-                batch_size=16384
-            )
-            print(f"✅ Kafka producer connected to {KAFKA_BOOTSTRAP}")
-            return producer
-        except NoBrokersAvailable:
-            print(f"⏳ Kafka not ready (attempt {attempt+1}/{retries}). "
-                  f"Retrying in {delay}s...")
-            time.sleep(delay)
-    raise RuntimeError("❌ Could not connect to Kafka after retries.")
-
-
 class StateDebouncer:
     """
     Prevents rapid flickering between ACTIVE/INACTIVE
@@ -135,24 +121,35 @@ class StateDebouncer:
         active_count = buf.count("ACTIVE")
         return "ACTIVE" if active_count > len(buf) // 2 else "INACTIVE"
 
+#  Initialise components 
+model    = YOLO("models/prototype_model.pt")
+model.to("cpu")
 
-frames=[]
+tracker  = DeepSort(max_age=30, embedder_gpu=False)
+flow_eng = OpticalFlowEngine()
+debounce = StateDebouncer()
+act_cls  = ActivityClassifier()
+util_trk = UtilizationTracker()
+producer = create_kafka_producer()
+
+try:
+    redis_client = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, db=0, socket_timeout=1)
+    redis_client.ping()
+    print(f"Redis connected at {REDIS_HOST}:{REDIS_PORT}")
+except Exception as e:
+    print(f"Redis connection failed: {e}")
+    redis_client = None
+frames= []
+payloads=[]
+
+
 
 def process_video(video_path: str):
     print(f"Loading video: {video_path}")
     print(f"Kafka: {KAFKA_BOOTSTRAP} → topic: {KAFKA_TOPIC}")
     print(f"Session ID: {SESSION_ID}")
 
-    # ── Initialise components ──────────────────────────────────────
-    model    = YOLO("models/best.pt")
-    model.to("cpu")
-
-    tracker  = DeepSort(max_age=30, embedder_gpu=False)
-    flow_eng = OpticalFlowEngine()
-    debounce = StateDebouncer()
-    act_cls  = ActivityClassifier()
-    util_trk = UtilizationTracker()
-    producer = create_kafka_producer()
+ 
 
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
@@ -256,21 +253,23 @@ def process_video(video_path: str):
 
                 # After send the pyalod to kafka i will save the output/payload for later use
                 if COLLECT_TRAINING_DATA:
-                    with open("outputs/all_predictions.csv", 'a', newline='') as f:
-                        writer = csv.DictWriter(f, fieldnames=payload.keys())
-                        if f.tell() == 0:
-                            writer.writeheader()
-                        writer.writerow(payload)
+                    payloads.append(payload)
                 # ── Annotate frame ─────────────────────────────────
                 helpers.draw_annotations(frame, payload)
 
-
+                if redis_client:
+                    try:
+                        _, buffer = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
+                        redis_client.set(REDIS_FRAME_KEY, buffer.tobytes())
+                    except Exception as e:
+                        print(f"Redis stream error: {e}")
             # save data for training
-            # ── Display ────────────────────────────────────────────
+            #  Display 
             frames.append(frame)
-            cv2.imshow("Construction Monitor", frame)
-            if cv2.waitKey(1) & 0xFF == ord('q'):
-                break
+            # cv2.imshow("Construction Monitor", frame)
+            # if cv2.waitKey(1) & 0xFF == ord('q'):
+            #     break
+            cv2.imwrite("outputs/latest_frame.jpg", frame)
 
             frame_count += 1
 
@@ -280,21 +279,22 @@ def process_video(video_path: str):
 
     finally:
         helpers.video_saver(frames)
+        helpers.save_results_json(payloads=payloads)
         cap.release()
         cv2.destroyAllWindows()
         producer.flush()
         producer.close()
 
         # Print final summary
-        print("\nFinal Utilization Summary:")
-        print(f"{'Track':>6}  {'Class':<24} {'Active':>8}  "
-              f"{'Idle':>8}  {'Total':>8}  {'Util%':>7}")
-        print("-" * 70)
-        for row in util_trk.get_summary():
-            print(f"{row['track_id']:>6}  {row['class_name']:<24} "
-                  f"{row['active_sec']:>8.1f}  {row['idle_sec']:>8.1f}  "
-                  f"{row['total_sec']:>8.1f}  {row['util_pct']:>6.1f}%")
+        # print("\nFinal Utilization Summary:")
+        # print(f"{'Track':>6}  {'Class':<24} {'Active':>8}  "
+        #       f"{'Idle':>8}  {'Total':>8}  {'Util%':>7}")
+        # print("-" * 70)
+        # for row in util_trk.get_summary():
+        #     print(f"{row['track_id']:>6}  {row['class_name']:<24} "
+        #           f"{row['active_sec']:>8.1f}  {row['idle_sec']:>8.1f}  "
+        #           f"{row['total_sec']:>8.1f}  {row['util_pct']:>6.1f}%")
 
-        print(f"\nDone — {frame_count} frames processed.")
+        # print(f"\nDone — {frame_count} frames processed.")
 
 

@@ -1,5 +1,17 @@
 services:
-  # 1. Apache Kafka (The Message Broker)
+  # ── Redis (Frame Streaming) ─────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: redis-cache
+    ports:
+      - "6379:6379"
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+  # ── Apache Kafka ────────────────────────────────────────────
   kafka:
     image: confluentinc/cp-kafka:latest
     container_name: kafka-broker
@@ -16,14 +28,14 @@ services:
       KAFKA_CLUSTER_ID: '4L6g3nShT-eMCtK--X86sw'
       KAFKA_LISTENERS: 'CONTROLLER://kafka:29093,PLAINTEXT://kafka:29092,PLAINTEXT_HOST://0.0.0.0:9092'
       KAFKA_INTER_BROKER_LISTENER_NAME: 'PLAINTEXT'
-      KAFKA_AUTO_CREATE_TOPICS_ENABLE: 'true' # Allows your code to create topics automatically
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: 'true'
     healthcheck:
       test: ["CMD", "kafka-broker-api-versions", "--bootstrap-server", "kafka:29092"]
       interval: 10s
       timeout: 10s
       retries: 5
 
-  # 2. TimescaleDB (The Database)
+  # ── TimescaleDB ─────────────────────────────────────────────
   db:
     image: timescale/timescaledb:latest-pg14
     container_name: timescaledb
@@ -33,3 +45,58 @@ services:
       POSTGRES_PASSWORD: password
       POSTGRES_USER: postgres
       POSTGRES_DB: construction_db
+    volumes:
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql:Z
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d construction_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # ── DB Ingester (Kafka → TimescaleDB) ──────────────────────
+  db-ingester:
+    build:
+      context: .
+      dockerfile: services/db_service/Dockerfile
+    container_name: db-ingester
+    restart: unless-stopped
+    environment:
+      - PYTHONUNBUFFERED=1  
+      - KAFKA_BOOTSTRAP=kafka:29092
+      - DB_HOST=db
+      - DB_USER=postgres
+      - DB_PASSWORD=password
+      - DB_NAME=construction_db
+    depends_on:
+      kafka:
+        condition: service_healthy
+      db:
+        condition: service_healthy
+  ui:
+    build:
+      context: .
+      dockerfile: ui/Dockerfile
+    container_name: gradio-ui
+    ports:
+      - "7860:7860"
+    volumes:
+      - ./models:/app/models:Z
+      - ./inputs:/app/inputs:Z
+      - ./outputs:/app/outputs:Z
+    environment:
+      - PYTHONUNBUFFERED=1
+      - DB_HOST=db
+      - DB_USER=postgres
+      - DB_PASSWORD=password
+      - DB_NAME=construction_db
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - KAFKA_BOOTSTRAP=kafka:29092
+    depends_on:
+      - db
+      - redis
+      - kafka
+    command: python ui/app.py
+volumes:
+  pgdata:
